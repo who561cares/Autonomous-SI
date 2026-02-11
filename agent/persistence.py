@@ -1,4 +1,4 @@
-"""SQLite-backed persistence for state and memory."""
+"""SQLite-backed persistence for state, memory, and reflections."""
 
 from __future__ import annotations
 
@@ -38,6 +38,16 @@ class SQLiteStore:
                     ts TEXT NOT NULL,
                     user TEXT NOT NULL,
                     assistant TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reflections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    turn INTEGER NOT NULL,
+                    payload TEXT NOT NULL
                 )
                 """
             )
@@ -88,3 +98,23 @@ class SQLiteStore:
                 (max_items,),
             )
             conn.commit()
+
+    def append_reflection(self, ts: str, turn: int, reflection: dict[str, Any]) -> None:
+        payload = json.dumps(reflection, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO reflections(ts, turn, payload) VALUES (?, ?, ?)",
+                (ts, turn, payload),
+            )
+            conn.commit()
+
+    def load_reflections(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT ts, turn, payload FROM reflections ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            result.append({"ts": row["ts"], "turn": row["turn"], "reflection": json.loads(row["payload"])})
+        return result

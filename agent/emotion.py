@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent.adaptation_profile import ACTIVE_PROFILE, AdaptationProfile
+
 POSITIVE_WORDS = {
     "good",
     "great",
@@ -57,16 +59,26 @@ def score_sentiment(message: str) -> float:
     return (pos - neg) / max(len(words), 1)
 
 
-def update_emotional_state(state: EmotionalState, message: str) -> EmotionalState:
+def update_emotional_state(
+    state: EmotionalState,
+    message: str,
+    profile: AdaptationProfile = ACTIVE_PROFILE,
+) -> EmotionalState:
     sentiment = score_sentiment(message)
     length_factor = min(len(message) / 140.0, 1.0)
 
-    next_valence = _clamp((state.valence * 0.82) + (sentiment * 1.2))
-    next_arousal = _clamp((state.arousal * 0.7) + (length_factor * 0.5), 0.0, 1.0)
+    next_valence = _clamp((state.valence * profile.valence_decay) + (sentiment * profile.valence_sentiment_gain))
+    next_arousal = _clamp(
+        (state.arousal * profile.arousal_decay) + (length_factor * profile.arousal_length_gain),
+        0.0,
+        1.0,
+    )
 
-    intimacy_delta = 0.03 + (0.08 if len(message.split()) > 6 else 0.0)
+    intimacy_delta = profile.intimacy_base_gain
+    if len(message.split()) > 6:
+        intimacy_delta += profile.intimacy_long_message_bonus
     if sentiment < -0.2:
-        intimacy_delta -= 0.02
+        intimacy_delta -= profile.intimacy_negative_penalty
     next_intimacy = _clamp(state.intimacy + intimacy_delta, 0.0, 1.0)
 
     return EmotionalState(next_valence, next_arousal, next_intimacy)

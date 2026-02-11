@@ -1,20 +1,21 @@
-"""Self-modification logic with test-and-rollback safety."""
+"""Self-modification logic with model-driven proposals and safe apply/rollback."""
 
 from __future__ import annotations
 
+import ast
 import difflib
+import json
 import os
-import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from agent.config import CHANGE_LOG_FILE, MAX_CODE_REVISIONS, TARGET_SELF_MOD_FILE
+from agent.config import CHANGE_LOG_FILE, TARGET_SELF_MOD_FILE
+from agent.goals import should_suspend_evolution
 
-
-GEN_RE = re.compile(r"^EVOLUTION_GENERATION\s*=\s*(\d+)\s*$", re.MULTILINE)
-PHRASE_BLOCK_RE = re.compile(r"STYLE_PHRASES\s*=\s*\[(?P<body>.*?)\]\n", re.DOTALL)
+PROFILE_FILE = TARGET_SELF_MOD_FILE.parent / "adaptation_profile.py"
 
 
 def _timestamp() -> str:
@@ -27,52 +28,57 @@ def _append_log(message: str) -> None:
         handle.write(f"[{_timestamp()}] {message}\n")
 
 
-def should_modify(turn_count: int, emotional_state: dict[str, float], interval_turns: int = 6) -> bool:
-    if turn_count <= 0:
-        return False
-    if turn_count % interval_turns == 0:
-        return True
-    if emotional_state["valence"] < -0.45:
-        return True
-    return False
+def should_modify(turn_count: int, interval_turns: int = 6) -> bool:
+    return turn_count > 0 and turn_count % interval_turns == 0
 
 
-def _next_phrase(generation: int) -> str:
-    phrase_bank = [
-        "I want to become more helpful each turn.",
-        "Your feedback informs my next revision.",
-        "I can evolve safely through testing.",
-        "I keep improving while preserving stability.",
-        "I adapt to you with deliberate care.",
-    ]
-    return phrase_bank[generation % len(phrase_bank)]
+def _bounded(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
-def build_candidate_source(existing_source: str) -> str:
-    match = GEN_RE.search(existing_source)
-    if not match:
-        raise ValueError("Missing EVOLUTION_GENERATION constant in response profile.")
+def generate_change_proposal(state: dict[str, Any], memory: list[dict[str, Any]]) -> dict[str, Any]:
+    """Generate a model-style proposal from interaction metrics."""
+    recent = memory[-6:]
+    user_lengths = [len(item["user"].split()) for item in recent] or [5]
+    avg_words = sum(user_lengths) / len(user_lengths)
 
-    current_generation = int(match.group(1))
-    next_generation = min(current_generation + 1, MAX_CODE_REVISIONS)
-    updated = GEN_RE.sub(f"EVOLUTION_GENERATION = {next_generation}", existing_source, count=1)
+    relational_stability = float(state.get("relational_stability", 0.7))
+    utility_score = float(state.get("utility_score", 0.5))
+    relational_depth_score = float(state.get("relational_depth_score", 0.5))
 
-    phrase_match = PHRASE_BLOCK_RE.search(updated)
-    if not phrase_match:
-        raise ValueError("Missing STYLE_PHRASES block in response profile.")
+    updates = {
+        "intimacy_base_gain": _bounded(0.025 + (0.015 if avg_words > 9 else 0.0), 0.01, 0.07),
+        "routing_memory_keyword_threshold": 1,
+        "routing_health_keyword_threshold": 1,
+        "repair_style_bias": _bounded(0.2 + ((0.6 - relational_stability) * 0.35), 0.1, 0.35),
+        "valence_sentiment_gain": _bounded(1.1 + ((0.6 - utility_score) * 0.5), 0.8, 1.6),
+        "intimacy_negative_penalty": _bounded(0.02 + ((0.55 - relational_depth_score) * 0.03), 0.005, 0.04),
+    }
 
-    candidate_phrase = _next_phrase(next_generation)
-    body = phrase_match.group("body")
-    if candidate_phrase not in body:
-        insertion = f'    "{candidate_phrase}",\n'
-        new_body = body + insertion
-        updated = (
-            updated[: phrase_match.start("body")]
-            + new_body
-            + updated[phrase_match.end("body") :]
-        )
+    return {
+        "reasoning": {
+            "relational_stability": relational_stability,
+            "utility_score": utility_score,
+            "relational_depth_score": relational_depth_score,
+            "avg_recent_user_words": avg_words,
+        },
+        "target_file": str(PROFILE_FILE),
+        "updates": updates,
+    }
 
-    return updated
+
+def _set_profile_updates(source: str, updates: dict[str, Any]) -> str:
+    tree = ast.parse(source)
+    replacement_map = {k: ast.Constant(v) for k, v in updates.items()}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "ACTIVE_PROFILE" for t in node.targets):
+            if isinstance(node.value, ast.Call):
+                for keyword in node.value.keywords:
+                    if keyword.arg in replacement_map:
+                        keyword.value = replacement_map[keyword.arg]
+
+    return ast.unparse(tree) + "\n"
 
 
 def _run_tests(project_root: Path) -> tuple[bool, str]:
@@ -90,22 +96,35 @@ def _run_tests(project_root: Path) -> tuple[bool, str]:
     return proc.returncode == 0, proc.stdout
 
 
-def attempt_self_modification(project_root: Path) -> dict:
-    target = TARGET_SELF_MOD_FILE
+def attempt_self_modification(
+    project_root: Path,
+    state: dict[str, Any],
+    memory: list[dict[str, Any]],
+    relational_threshold: float,
+) -> dict[str, Any]:
+    if should_suspend_evolution(float(state.get("relational_stability", 0.0)), relational_threshold):
+        reason = "relational stability below threshold; evolution suspended"
+        _append_log(f"SUSPEND {reason}")
+        return {"changed": False, "status": "suspended", "reason": reason}
+
+    target = PROFILE_FILE
     if not target.exists():
         reason = f"target file not found: {target}"
         _append_log(f"SKIP {reason}")
         return {"changed": False, "status": "skipped", "reason": reason}
 
+    proposal = generate_change_proposal(state, memory)
     original_source = target.read_text(encoding="utf-8")
-    candidate_source = build_candidate_source(original_source)
+    candidate_source = _set_profile_updates(original_source, proposal["updates"])
     if candidate_source == original_source:
         _append_log("SKIP candidate source equals original")
-        return {"changed": False, "status": "skipped", "reason": "no-op"}
+        return {"changed": False, "status": "skipped", "reason": "no-op", "proposal": proposal}
 
+    temp_path = target.with_suffix(".py.tmp")
     backup_path = target.with_suffix(".py.bak")
+    temp_path.write_text(candidate_source, encoding="utf-8")
     shutil.copy2(target, backup_path)
-    target.write_text(candidate_source, encoding="utf-8")
+    shutil.copy2(temp_path, target)
 
     passed, output = _run_tests(project_root)
     diff = "\n".join(
@@ -118,26 +137,33 @@ def attempt_self_modification(project_root: Path) -> dict:
         )
     )
 
+    _append_log(f"PROPOSAL {json.dumps(proposal, ensure_ascii=False)}")
+    _append_log("TEST_OUTPUT_START")
+    _append_log(output.strip())
+    _append_log("TEST_OUTPUT_END")
+
     if passed:
+        temp_path.unlink(missing_ok=True)
         backup_path.unlink(missing_ok=True)
-        _append_log("APPLY self-modification accepted after tests passed")
+        _append_log("APPLY model-driven self-modification accepted after tests passed")
         _append_log(diff)
-        _append_log(output.strip())
         return {
             "changed": True,
             "status": "applied",
+            "proposal": proposal,
             "tests_output": output,
             "diff": diff,
         }
 
     shutil.copy2(backup_path, target)
+    temp_path.unlink(missing_ok=True)
     backup_path.unlink(missing_ok=True)
-    _append_log("ROLLBACK self-modification rejected after test failure")
+    _append_log("ROLLBACK model-driven self-modification rejected after test failure")
     _append_log(diff)
-    _append_log(output.strip())
     return {
         "changed": False,
         "status": "rolled_back",
+        "proposal": proposal,
         "tests_output": output,
         "diff": diff,
     }
